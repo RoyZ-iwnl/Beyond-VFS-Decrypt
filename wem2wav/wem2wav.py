@@ -4,6 +4,8 @@ import shutil
 import argparse
 import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 def find_vgmstream():
     """查找 vgmstream-cli 工具路径"""
@@ -31,7 +33,43 @@ def find_vgmstream():
 
     return None
 
-def batch_convert_wem_to_wav(source_folder, output_folder=None, vgmstream_path=None):
+def convert_single_wem(wem_path, output_folder, vgmstream_path):
+    """
+    转换单个WEM文件为WAV
+
+    参数:
+        wem_path: WEM文件路径
+        output_folder: 输出文件夹
+        vgmstream_path: vgmstream工具路径
+
+    返回:
+        (filename, success, error_msg): 文件名、是否成功、错误信息
+    """
+    filename = os.path.basename(wem_path)
+    try:
+        # 生成输出文件名
+        wav_filename = filename.rsplit('.', 1)[0] + '.wav'
+        wav_path = os.path.join(output_folder, wav_filename)
+
+        # 使用 vgmstream 转换
+        result = subprocess.run(
+            [vgmstream_path, '-o', wav_path, wem_path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            return (filename, True, None)
+        else:
+            return (filename, False, "vgmstream 返回错误")
+
+    except subprocess.TimeoutExpired:
+        return (filename, False, "转换超时")
+    except Exception as e:
+        return (filename, False, str(e))
+
+def batch_convert_wem_to_wav(source_folder, output_folder=None, vgmstream_path=None, max_workers=None):
     """
     批量将wem文件转换为wav文件（使用 vgmstream）
 
@@ -39,6 +77,7 @@ def batch_convert_wem_to_wav(source_folder, output_folder=None, vgmstream_path=N
         source_folder: wem文件所在的文件夹路径
         output_folder: 输出wav文件的文件夹路径（可选，默认为wem2wavoutput）
         vgmstream_path: vgmstream-cli 工具路径（可选，自动查找）
+        max_workers: 最大线程数（可选，默认为CPU核心数）
     """
     # 查找 vgmstream 工具
     if vgmstream_path is None:
@@ -83,42 +122,42 @@ def batch_convert_wem_to_wav(source_folder, output_folder=None, vgmstream_path=N
         print(f"警告: 在 {source_folder} 中未找到 .wem 文件")
         return False
 
+    # 设置线程数
+    if max_workers is None:
+        max_workers = os.cpu_count() or 4
+
     print(f"找到 {total_wem_files} 个 .wem 文件")
     print(f"源文件夹: {os.path.abspath(source_folder)}")
     print(f"输出文件夹: {os.path.abspath(output_folder)}")
+    print(f"使用线程数: {max_workers}")
     print("-" * 60)
 
-    # 遍历源文件夹中的所有wem文件
-    for idx, filename in enumerate(wem_files, 1):
-        wem_path = os.path.join(source_folder, filename)
-        print(f"[{idx}/{total_wem_files}] 处理: {filename}", end=" ... ")
+    # 准备所有文件路径
+    wem_paths = [os.path.join(source_folder, filename) for filename in wem_files]
 
-        try:
-            # 生成输出文件名
-            wav_filename = filename.rsplit('.', 1)[0] + '.wav'
-            wav_path = os.path.join(output_folder, wav_filename)
+    # 使用线程池并行处理
+    print_lock = Lock()
+    completed = 0
 
-            # 使用 vgmstream 转换
-            result = subprocess.run(
-                [vgmstream_path, '-o', wav_path, wem_path],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_file = {
+            executor.submit(convert_single_wem, wem_path, output_folder, vgmstream_path): wem_path
+            for wem_path in wem_paths
+        }
 
-            if result.returncode == 0:
-                print(f"成功")
-                success_count += 1
-            else:
-                print(f"失败 - vgmstream 返回错误")
-                failed_files.append(filename)
+        # 处理完成的任务
+        for future in as_completed(future_to_file):
+            filename, success, error_msg = future.result()
+            completed += 1
 
-        except subprocess.TimeoutExpired:
-            print(f"失败 - 转换超时")
-            failed_files.append(filename)
-        except Exception as e:
-            print(f"失败 - {str(e)}")
-            failed_files.append(filename)
+            with print_lock:
+                if success:
+                    print(f"[{completed}/{total_wem_files}] ✓ {filename}")
+                    success_count += 1
+                else:
+                    print(f"[{completed}/{total_wem_files}] ✗ {filename} - {error_msg}")
+                    failed_files.append(filename)
     
     # 输出转换结果摘要
     print("-" * 60)
@@ -162,6 +201,14 @@ def main():
         help='输出 WAV 文件的文件夹路径（默认: wem2wavoutput）'
     )
 
+    parser.add_argument(
+        '-w', '--workers',
+        dest='max_workers',
+        type=int,
+        default=None,
+        help='最大线程数（默认: CPU核心数）'
+    )
+
     args = parser.parse_args()
 
     # 获取输入文件夹
@@ -188,7 +235,7 @@ def main():
 
     # 执行转换
     print()
-    success = batch_convert_wem_to_wav(source_folder, output_folder)
+    success = batch_convert_wem_to_wav(source_folder, output_folder, max_workers=args.max_workers)
 
     if success:
         print("\n转换任务完成!")
