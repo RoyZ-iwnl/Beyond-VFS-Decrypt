@@ -154,6 +154,166 @@ def decrypt_pck_file(file_path: str) -> bytes:
 
     return new_data
 
+def get_pck_header(pck_data: bytes) -> bytes:
+    """
+    获取 PCK 文件的解密后头部
+
+    :param pck_data: PCK 文件的完整数据
+    :return: 解密后的头部数据
+    """
+    if len(pck_data) < 8:
+        raise ValueError("PCK 文件太小")
+
+    magic = pck_data[:4]
+    header_size = struct.unpack('<I', pck_data[4:8])[0]
+    header_content = pck_data[8:8 + header_size]
+
+    if magic == b'AKPK':
+        return header_content
+    else:
+        # 加密的头部，需要解密
+        p_data = bytearray(header_content[4:])
+        decipher_inplace(p_data, header_size, header_size - 4, 0)
+        return bytes(p_data)
+
+def get_pck_entries(pck_data: bytes):
+    """
+    获取 PCK 文件中的所有音频条目
+
+    :param pck_data: PCK 文件的完整数据
+    :return: 生成器，返回 (file_id, one, size, offset, type_flag) 元组
+    """
+    header = get_pck_header(pck_data)
+
+    if header[:4] != b'AKPK':
+        # 需要添加魔数
+        header = b'AKPK' + len(header).to_bytes(4, 'little') + header
+
+    if header[:4] != b'AKPK':
+        raise ValueError("无效的 PCK 魔数")
+
+    lang_id_count = struct.unpack('<I', header[0x18:0x1C])[0]
+    lang_id_set = set(range(lang_id_count))
+
+    # 查找第一个 0x00000001 字段
+    first_one_pos = None
+    for i in range(0x24, len(header) - 4, 4):
+        if (header[i:i+4] == b'\x01\x00\x00\x00' and
+            struct.unpack('<I', header[i+12:i+16])[0] in lang_id_set):
+            first_one_pos = i
+            break
+
+    if first_one_pos is None:
+        raise ValueError("找不到 PCK 条目起始位置")
+
+    pos = first_one_pos - 8
+
+    for _ in range(2):
+        entries_count = struct.unpack('<I', header[pos:pos+4])[0]
+        pos += 4
+
+        for i in range(entries_count):
+            if pos + 20 > len(header):
+                raise ValueError("PCK 头部数据不足")
+
+            entry = struct.unpack('<5I', header[pos:pos+20])
+
+            if entry[1] == 1:  # uint32 ID
+                if entry[4] in lang_id_set:
+                    yield entry
+                    pos += 20
+                    continue
+
+            if entry[2] == 1:  # uint64 ID
+                entry = (*entry, struct.unpack('<I', header[pos+20:pos+24])[0])
+                if entry[5] in lang_id_set:
+                    yield (entry[0] | (entry[1] << 32), *entry[2:])
+                    pos += 24
+                    continue
+
+            raise ValueError("无法确定 PCK 条目格式")
+
+        if pos + 4 > len(header):
+            return
+
+def extract_pck_file(pck_data: bytes, entry) -> bytes:
+    """
+    从 PCK 数据中提取单个音频文件
+
+    :param pck_data: PCK 文件的完整数据
+    :param entry: 文件条目 (file_id, one, size, offset, type_flag)
+    :return: 解密后的文件数据
+    """
+    file_id, one, size, offset, _ = entry
+
+    if one != 1:
+        raise ValueError(f"条目字段异常: 0x{one:08X}")
+
+    # 读取文件数据 - offset是相对于PCK文件开头的绝对偏移
+    file_data = bytearray(pck_data[offset : offset + size])
+
+    if len(file_data) != size:
+        raise ValueError("读取大小不匹配")
+
+    # 使用 file_id 作为种子解密
+    decipher_inplace(file_data, file_id, size, 0)
+
+    return bytes(file_data)
+
+def extract_pck_audio(pck_path: str, pck_data: bytes, output_root: str):
+    """
+    从 PCK 文件中提取音频文件 (WEM, BNK, PLG 等)
+
+    :param pck_path: PCK 文件路径
+    :param pck_data: PCK 文件的完整数据
+    :param output_root: 输出根目录
+    """
+    pck_name = os.path.splitext(os.path.basename(pck_path))[0]
+    audio_output_dir = os.path.join(output_root, f"{pck_name}_audio")
+    os.makedirs(audio_output_dir, exist_ok=True)
+
+    print(f"      [PCK] 开始提取音频文件...")
+
+    try:
+        # 获取所有条目
+        entries = list(get_pck_entries(pck_data))
+        print(f"      [PCK] 找到 {len(entries)} 个音频条目")
+
+        extracted_count = 0
+        for entry in entries:
+            file_id = entry[0]
+            try:
+                # 提取文件数据 - offset已经是绝对偏移，不需要offset_base
+                file_data = extract_pck_file(pck_data, entry)
+
+                # 根据魔数判断文件类型
+                magic_bytes = file_data[:4]
+                if magic_bytes == b'RIFF':
+                    ext = 'wem'
+                elif magic_bytes == b'BKHD':
+                    ext = 'bnk'
+                elif magic_bytes == b'PLUG':
+                    ext = 'plg'
+                else:
+                    ext = 'unknown'
+
+                # 保存文件
+                output_name = f"{file_id}.{ext}"
+                output_path = os.path.join(audio_output_dir, output_name)
+
+                with open(output_path, 'wb') as f:
+                    f.write(file_data)
+
+                extracted_count += 1
+
+            except Exception as e:
+                print(f"        [!] 提取音频 ID {file_id} 失败: {e}")
+
+        print(f"      [PCK] 成功提取 {extracted_count} 个音频文件到 {audio_output_dir}")
+
+    except Exception as e:
+        print(f"      [!] PCK 音频提取失败: {e}")
+
 def decrypt_blc_file(file_path: str) -> bytes:
     with open(file_path, 'rb') as f:
         content = f.read()
@@ -293,14 +453,17 @@ def extract_pkg(pkg: VFSPackage, output_root: str, keep_structure: bool = False)
                     f_out.write(final_data)
                 print(f"    [√] {file_info.file_name}")
 
-                # 如果是 PCK 文件，尝试解密
+                # 如果是 PCK 文件，尝试提取音频（保留加密的PCK文件）
                 if out_path.lower().endswith('.pck'):
                     try:
-                        decrypted_pck = decrypt_pck_file(out_path)
-                        with open(out_path, 'wb') as f_out:
-                            f_out.write(decrypted_pck)
+                        # 读取PCK数据用于提取音频
+                        with open(out_path, 'rb') as f_pck:
+                            pck_data = f_pck.read()
+
+                        # 提取 PCK 中的音频文件（不修改PCK文件本身）
+                        extract_pck_audio(out_path, pck_data, output_root)
                     except Exception as e:
-                        print(f"      [!] PCK 解密失败: {e}")
+                        print(f"      [!] PCK 音频提取失败: {e}")
 
         except Exception as e:
             print(f"  [!] 读取错误 {chk_name}: {e}")
