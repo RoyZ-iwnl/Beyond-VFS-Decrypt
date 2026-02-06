@@ -64,6 +64,33 @@ def generate_random_prefix(length=3):
     return ''.join(random.choices(string.ascii_uppercase, k=length))
 
 
+def generate_sequential_prefix(index, length=3):
+    """
+    生成顺序字母前缀（类似Excel列名：A, B, ..., Z, AA, AB, ...）
+
+    Args:
+        index: 索引（从0开始）
+        length: 最小前缀长度
+
+    Returns:
+        str: 顺序字母字符串
+    """
+    result = []
+    index += 1  # 转换为1-based索引
+
+    while index > 0:
+        index -= 1
+        result.append(string.ascii_uppercase[index % 26])
+        index //= 26
+
+    # 反转并确保最小长度
+    prefix = ''.join(reversed(result))
+    if len(prefix) < length:
+        prefix = 'A' * (length - len(prefix)) + prefix
+
+    return prefix
+
+
 def copy_and_rename_file(wav_file, actual_duration, group_prefix, output_path):
     """
     复制并重命名单个文件
@@ -165,15 +192,18 @@ def classify_wav_files(source_dir, output_dir=None, tolerance=0.1, max_workers=N
     print(f"\n根据时长分为 {len(duration_groups)} 组")
     print("正在复制和重命名文件...")
 
-    # 为每组生成随机前缀并使用多线程复制文件
+    # 为每组生成顺序前缀并使用多线程复制文件（时长最长的组使用AAA、AAB等）
     total_files = len(wav_files)
     processed = 0
     success_count = 0
     failed_count = 0
 
-    for group_duration, files in sorted(duration_groups.items()):
-        # 为这一组生成唯一的随机前缀
-        group_prefix = generate_random_prefix()
+    # 按时长从大到小排序，索引从0开始
+    sorted_groups = sorted(duration_groups.items(), reverse=True)
+
+    for group_index, (group_duration, files) in enumerate(sorted_groups):
+        # 为这一组生成顺序字母前缀（时长最长的组获得AAA）
+        group_prefix = generate_sequential_prefix(group_index)
 
         print(f"\n处理时长组 ~{group_duration:.2f}秒 (前缀: {group_prefix}): {len(files)} 个文件")
 
@@ -205,7 +235,7 @@ def classify_wav_files(source_dir, output_dir=None, tolerance=0.1, max_workers=N
     print(f"失败: {failed_count}")
 
     print("\n=== 分类统计 ===")
-    for group_duration, files in sorted(duration_groups.items()):
+    for group_duration, files in sorted(duration_groups.items(), reverse=True):
         print(f"时长 ~{group_duration:.2f}秒: {len(files)} 个文件")
 
 
